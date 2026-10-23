@@ -18,6 +18,23 @@
 #include "servidor/estado.h"
 #include <sstream> // Para separar palabras por espacios
 
+// Librerias para los hilos y el mutex
+#include <thread>      
+#include <mutex> 
+
+// Libreria para el mapa de canales
+#include <set>
+
+// Libreria para conectar con el guardado
+#include "servidor/buzon.h"
+#include <fstream> // Para leer archivos
+
+//Librerias para usar las fechas
+#include <chrono>
+#include <ctime>
+
+#include "servidor/http.h"
+
 namespace fs = std::filesystem; // abreviatura para no estar escribiendo stdd...
 
 // VARIABLES GLOBALES //
@@ -68,6 +85,353 @@ int iniciar_servidor(int puerto){
     std::cout << "[Servidor] Escuchando en el puerto " << puerto << "...\n";
     return server_fd; // Retornamos el descriptor del socket
 }    
+
+void atender_cliente(int client_fd) {
+    //Enviamos el saludo inicial
+    std::string saludo = "200 servidor-prueba listo\r\n";
+    send(client_fd, saludo.c_str(), saludo.length(), 0);
+
+    //Registrar al cliente en el estado (protegido por el candado)
+    {
+        std::lock_guard<std::mutex> lock(estado_global.candado);
+        estado_global.usuarios_conectados[client_fd] = {"", client_fd, false, {}};
+    }
+
+    std::string buffer_cliente; // Buffer acumulador para la delimitacion
+    char buffer_recv[1024]; // Buffer temporal
+
+
+    // BUCLE PRINCIPAL
+    while (true) {
+        //Primero limpiamos el buffer y luego leemos los bytes que llegan del cliente
+        memset(buffer_recv, 0, sizeof(buffer_recv));
+        int bytes_leidos = recv(client_fd, buffer_recv, sizeof(buffer_recv), 0);
+        
+        //si recibimos un cero o menos., cerramos la conexion
+        if (bytes_leidos <= 0) {
+            std::cout << "[Servidor] Cliente desconectado abruptamente.\n";
+            std::lock_guard<std::mutex> lock(estado_global.candado);
+            estado_global.usuarios_conectados.erase(client_fd);
+            break; //Rompe el while y la funcion termina
+        }
+
+        buffer_cliente.append(buffer_recv, bytes_leidos);
+        
+        // VAlidacion del 502
+        if (buffer_cliente.length() > 512) {
+            std::string error502 = "502 Línea demasiado larga\r\n";
+            send(client_fd, error502.c_str(), error502.length(), 0);
+            
+            // MODO DESCARTE: Leemos y tiramos a la basura hasta encontrar un \r\n
+            bool encontrado_crlf = false;
+            while (!encontrado_crlf) {
+                memset(buffer_recv, 0, sizeof(buffer_recv));
+                int bytes_extra = recv(client_fd, buffer_recv, sizeof(buffer_recv), 0);
+                
+                if (bytes_extra <= 0) {
+                    encontrado_crlf = true; // Se desconectó
+                } else {
+                    std::string temp(buffer_recv, bytes_extra);
+                    if (temp.find("\r\n") != std::string::npos) {
+                        encontrado_crlf = true; // Encontramos el fin de la línea
+                    }
+                }
+            }
+            buffer_cliente.clear(); // Limpiamos y volvemos al inicio del while
+            continue; 
+        }
+        
+        std::vector<std::string> lineas = extraer_lineas(buffer_cliente);
+
+        bool cerrar_conexion = false; //Bandera si el cliente hace QUIT
+
+        // COMANDOS
+        for (const std::string& linea : lineas) {
+            if (linea.empty()) continue;
+
+            std::istringstream iss(linea);
+            std::string comando, arg1;
+            iss >> comando >> arg1; 
+
+            for (char& c : comando) c = toupper(c);
+
+            //Protegemos el acceso al usuario
+            std::lock_guard<std::mutex> lock(estado_global.candado);
+            Usuario& usuario = estado_global.usuarios_conectados[client_fd];
+
+            //Comando QUIT
+            if (comando == "QUIT") {
+                // borrados pendientes (DELE)
+                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                for (int idx : usuario.mensajes_a_borrar) {
+                    // idx es 1-based (el primero es 1)
+                    if (idx > 0 && idx <= (int)mensajes.size()) {
+                        borrar_mensaje(mensajes[idx - 1]);
+                    }
+                }
+                usuario.mensajes_a_borrar.clear();
+
+                std::string resp = "299 Adiós\r\n";
+                send(client_fd, resp.c_str(), resp.length(), 0);
+                cerrar_conexion = true;
+                break; 
+            }
+
+            else if (comando == "NICK") {
+                if (arg1.empty() || arg1.length() > 16) {
+                    std::string resp = "501 Apodo inválido (1-16 caracteres)\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else if (estado_global.apodo_en_uso(arg1)) {
+                    std::string resp = "433 Apodo en uso\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else {
+                    usuario.apodo = arg1;
+                    usuario.registrado = true;
+                    std::string resp = "201 Bienvenido, " + arg1 + "\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    std::cout << "[Servidor] Cliente " << client_fd << " registrado como " << arg1 << "\n";
+                
+                    // Avisamos si hay mensajes en el buzon
+                    auto mensajes = obtener_mensajes(dir_buzones, arg1);
+                    if (!mensajes.empty()) {
+                        std::string resp303 = "303 " + std::to_string(mensajes.size()) + "\r\n";
+                        send(client_fd, resp303.c_str(), resp303.length(), 0);
+                    }
+
+                    // Crear la carpeta para los futuros mensajes
+                    fs::path carpeta_usuario = fs::path(dir_buzones) / arg1;
+                    if (!fs::exists(carpeta_usuario)) {
+                        fs::create_directories(carpeta_usuario);
+                    }
+                }
+            }
+
+            // COMANDO JOIN
+            else if (comando == "JOIN") {
+                if (arg1.empty() || arg1[0] != '#') {
+                    std::string resp = "501 Canal inválido (debe empezar con #)\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else {
+                    // Agregamos al usuario al canal
+                    estado_global.canales[arg1].miembros.insert(client_fd);
+                    
+                    // El que se une recibe la confirmación 210
+                    std::string resp = "210 Unida a " + arg1 + "\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+
+                    // Avisamos a TODOS los del canal (incluyendo al que entró) con el evento 302
+                    std::string aviso = "302 " + arg1 + " " + usuario.apodo + " entró\r\n";
+                    for (int fd : estado_global.canales[arg1].miembros) {
+                        send(fd, aviso.c_str(), aviso.length(), 0);
+                    }
+                }
+            }
+
+            // COMANDO PART
+            else if (comando == "PART") {
+                if (estado_global.canales.count(arg1) && estado_global.canales[arg1].miembros.count(client_fd)) {
+                    estado_global.canales[arg1].miembros.erase(client_fd);
+                    
+                    std::string resp = "211 Saliste de " + arg1 + "\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+
+                    std::string aviso = "302 " + arg1 + " " + usuario.apodo + " salió\r\n";
+                    for (int fd : estado_global.canales[arg1].miembros) {
+                        send(fd, aviso.c_str(), aviso.length(), 0);
+                    }
+                } else {
+                    std::string resp = "442 No eres miembro de ese canal\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+
+            // COMANDO MSG
+            else if (comando == "MSG") {
+                // Separamos el canal del resto del texto (que puede tener espacios)
+                size_t espacio = linea.find(' ', 4); // 4 porque "MSG " mide 4 letras
+                if (espacio != std::string::npos) {
+                    std::string canal = linea.substr(4, espacio - 4);
+                    std::string texto = linea.substr(espacio + 1);
+
+                    if (estado_global.canales.count(canal) && estado_global.canales[canal].miembros.count(client_fd)) {
+                        //Guardar en el historial con hora
+                        auto ahora = std::chrono::system_clock::now();
+                        std::time_t t = std::chrono::system_clock::to_time_t(ahora);
+                        std::tm tm_buf;
+                        localtime_r(&t, &tm_buf);
+                        char hora_str[10];
+                        std::strftime(hora_str, sizeof(hora_str), "%H:%M:%S", &tm_buf);
+                        
+                        std::string linea_historial = std::string(hora_str) + " [" + usuario.apodo + "] " + texto;
+                        estado_global.canales[canal].historial.push_back(linea_historial);
+                        
+                        // Mantener solo los últimos 50
+                        if (estado_global.canales[canal].historial.size() > 50) {
+                            estado_global.canales[canal].historial.erase(estado_global.canales[canal].historial.begin());
+                        }
+                        
+                        // Confirmación al emisor
+                        std::string resp = "250 OK\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+
+                        // Enviar a los demás (el emisor no recibe el evento 300)
+                        std::string mensaje_evt = "300 " + canal + " " + " [" + usuario.apodo + "] " + texto + "\r\n";
+                        for (int fd : estado_global.canales[canal].miembros) {
+                            if (fd != client_fd) { // El emisor no recibe su propio mensaje
+                                send(fd, mensaje_evt.c_str(), mensaje_evt.length(), 0);
+                            }
+                        }
+                    } else {
+                        std::string resp = "442 No eres miembro de ese canal\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    }
+                }
+            }
+
+            // COMANDO WHO
+            else if (comando == "WHO") {
+                if (estado_global.canales.count(arg1)) {
+                    auto& miembros = estado_global.canales[arg1].miembros;
+                    for (int fd : miembros) {
+                        std::string resp = "213 " + estado_global.obtener_apodo(fd) + "\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    }
+                    // Línea final
+                    std::string final_resp = "213 " + std::to_string(miembros.size()) + " miembros\r\n";
+                    send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+                } else {
+                    std::string resp = "551 Canal inexistente\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+
+            // COMANDO CHANS
+            else if (comando == "CHANS") {
+                for (const auto& par : estado_global.canales) {
+                    std::string resp = "212-" + par.first + " " + std::to_string(par.second.miembros.size()) + "\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+                std::string final_resp = "212 " + std::to_string(estado_global.canales.size()) + " canales\r\n";
+                send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+            }
+
+            // COMANDO PRIV
+            else if (comando == "PRIV") {
+                // Separamos el destinatario (arg1) del texto (que puede tener espacios)
+                size_t espacio = linea.find(' ', 5); // 5 porque "PRIV " mide 5 letras
+                if (espacio != std::string::npos && !arg1.empty()) {
+                    std::string destinatario = arg1;
+                    std::string texto = linea.substr(espacio + 1);
+
+                    int fd_destino = estado_global.obtener_socket(destinatario);
+
+                    if (fd_destino != -1) {
+                        // El destinatario ESTÁ conectado -> Enviar evento 301
+                        std::string evt = "301 [" + usuario.apodo + "] " + texto + "\r\n";
+                        send(fd_destino, evt.c_str(), evt.length(), 0);
+                        
+                        std::string resp = "250 Mensaje entregado\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    } else {
+                        // El destinatario NO está conectado -> Verificar si existe en disco
+                        fs::path carpeta = fs::path(dir_buzones) / destinatario;
+                        if (fs::exists(carpeta)) {
+                            // Existe -> Guardar en buzón (RFC 5322)
+                            guardar_en_buzon(dir_buzones, destinatario, usuario.apodo, texto);
+                            std::string resp = "251 Usuario desconectado; mensaje guardado en su buzón\r\n";
+                            send(client_fd, resp.c_str(), resp.length(), 0);
+                        } else {
+                            // No existe -> Error 550
+                            std::string resp = "550 Usuario desconocido\r\n";
+                            send(client_fd, resp.c_str(), resp.length(), 0);
+                        }
+                    }
+                } else {
+                    std::string resp = "501 Sintaxis inválida\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+
+            // COMANDO DEL BUZON ---------------------------------------- //
+            // COMANDO STAT
+            else if (comando == "STAT") {
+                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                uintmax_t total_bytes = 0;
+                for (const auto& m : mensajes) total_bytes += fs::file_size(m);
+                std::string resp = "220 " + std::to_string(mensajes.size()) + " " + std::to_string(total_bytes) + "\r\n";
+                send(client_fd, resp.c_str(), resp.length(), 0);
+            }
+
+            // COMANDO LIST
+            else if (comando == "LIST") {
+                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                for (size_t i = 0; i < mensajes.size(); ++i) {
+                    std::string resp = "221-" + std::to_string(i + 1) + " " + std::to_string(fs::file_size(mensajes[i])) + "\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+                std::string final_resp = "221 " + std::to_string(mensajes.size()) + " mensajes\r\n";
+                send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+            }
+
+            //COMANDO RETR
+            else if (comando == "RETR") {
+                int n = std::stoi(arg1);
+                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                if (n > 0 && n <= (int)mensajes.size()) {
+                    std::ifstream archivo(mensajes[n - 1]);
+                    std::string linea;
+                    while (std::getline(archivo, linea)) {
+                        // getline remueve el \n, así que se lo volvemos a poner (o \r\n)
+                        std::string resp = "222-" + linea + "\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    }
+                    std::string fin = "222 fin del mensaje\r\n";
+                    send(client_fd, fin.c_str(), fin.length(), 0);
+                } else {
+                    std::string resp = "552 No existe ese número de mensaje\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+
+            // COMANDO DELE
+            else if (comando == "DELE") {
+                try {
+                    int n = std::stoi(arg1);
+                    auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                    if (n > 0 && n <= (int)mensajes.size()) {
+                        usuario.mensajes_a_borrar.insert(n); // Solo lo marcamos
+                        std::string resp = "223 Mensaje " + std::to_string(n) + " marcado para borrar\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    } else {
+                        std::string resp = "552 No existe ese número de mensaje\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    }
+                } catch (...) {
+                    std::string resp = "501 Número inválido\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+
+            else {
+                if (!usuario.registrado) {
+                    std::string resp = "530 Primero debes registrarte con NICK\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else {
+                    std::string resp = "500 Comando desconocido o no implementado\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                }
+            }
+        }
+
+        if (cerrar_conexion) {
+            std::lock_guard<std::mutex> lock(estado_global.candado);
+            estado_global.usuarios_conectados.erase(client_fd);
+            break; 
+        }
+    }
+    close(client_fd);
+    std::cout << "[Servidor] Hilo del cliente " << client_fd << " finalizado.\n";
+}
 
 // FUNCION MAIN
 int main(int argc, char* argv[]){
@@ -135,110 +499,28 @@ int main(int argc, char* argv[]){
     // BUCLE PRINCIPAL
     int server_fd = iniciar_servidor(puerto_chat);
 
+    // Iniciamos el hilo del servidor http
+    std::thread hilo_http(iniciar_http, puerto_http, std::ref(estado_global));
+    hilo_http.detach();
+
     std::cout << "[Servidor] Esperando conexiones...\n";
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
     while(true){
-        // accept() se bloquea hasta que llega un cliente
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                int client_fd = accept(server_fd, (sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) continue;
-    
-        // Mostramos la ip que tiene el cliente´
+
         char ip_cliente[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), ip_cliente, INET_ADDRSTRLEN);
         std::cout << "[Servidor] ¡Cliente conectado desde " << ip_cliente << "!\n";
-        
-        // Enviamos el saludo general
-        std::string saludo = "200 servidor-prueba listo\r\n";
-        send(client_fd, saludo.c_str(), saludo.length(), 0);
-        
-        // Al conectarse, se registra en el estado de "no registrado"
-        estado_global.usuarios_conectados[client_fd] = {"", client_fd, false};
-        
-        // Aplicamos la delimitacion 
-        std::string buffer_cliente;
-        char buffer_recv[1024];
 
-        
-        while(true){
-            // Limpiamos primero el buffer de recepcion
-            memset(buffer_recv, 0, sizeof(buffer_recv));
-
-            // Recibimos hasta 1024 bytes
-            int bytes_leidos = recv(client_fd, buffer_recv, sizeof(buffer_recv), 0);
-            
-            // Si los bytes leidos son 0, el cliente cerro la conexion
-            if (bytes_leidos <= 0) {
-                std::cout << "[Servidor] Cliente desconectado.\n";
-                estado_global.usuarios_conectados.erase(client_fd);
-                break;
-            }
-
-            // Agregamos los bytes crudos al búfer acumulador
-            buffer_cliente.append(buffer_recv, bytes_leidos);
-
-            // Magia: Extraemos las líneas completas
-            std::vector<std::string> lineas = extraer_lineas(buffer_cliente);
-            bool cerrar_conexion = false;
-
-            // Procesamos cada línea completa
-            for (const std::string& linea : lineas) {
-                //Validamos que la linea no este vacia ni que exceda el tamañó
-                if(linea.empty()) continue;
-
-                //Separar el comando de los arg
-                std::istringstream iss(linea);
-                std::string comando, arg1;
-                iss >> comando >> arg1; // iss >> extrae palabras separadas por espacio
-            
-                // Convertimos el comando a mayuscula
-                for (char& c : comando) c = toupper(c);
-                Usuario& usuario = estado_global.usuarios_conectados[client_fd];
-            
-                //Procesamos cada comando
-                if (comando == "QUIT"){
-                    std::string resp = "299 Adiós\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
-                    cerrar_conexion = true;
-                    break; // Salir del for de líneas
-                }
-
-                else if (comando == "NICK"){
-                    if (arg1.empty() || arg1.length() > 16) {
-                        std::string resp = "501 Apodo inválido (1-16 caracteres)\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                    } else if (estado_global.apodo_en_uso(arg1)) {
-                        std::string resp = "433 Apodo en uso\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                    } else {
-                        usuario.apodo = arg1;
-                        usuario.registrado = true;
-                        std::string resp = "201 Bienvenido, " + arg1 + "\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                        std::cout << "[Servidor] Cliente " << client_fd << " registrado como " << arg1 << "\n";
-                        // Nota: Aquí iría el 303 si tuviera mensajes, lo haremos en el buzón.
-                    }
-                    }
-                else {
-                    // Si no es QUIT ni NICK, verificar si está registrado
-                    if (!usuario.registrado) {
-                        std::string resp = "530 Primero debes registrarte con NICK\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                    } else {
-                        // Si ya está registrado pero es un comando que no existe aún
-                        std::string resp = "500 Comando desconocido o no implementado\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                    }
-                }
-            }
-
-            if (cerrar_conexion) {
-                estado_global.usuarios_conectados.erase(client_fd);
-                break; // Sale del while de recv
-            }
-        }
-        close(client_fd);
+        // Lanzamos el hilo y lo separamos para que el bucle siga aceptando
+        std::thread hilo_cliente(atender_cliente, client_fd);
+        hilo_cliente.detach(); 
     }
+
+    close(server_fd);
+    return 0;
 }
     
