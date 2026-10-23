@@ -1,4 +1,5 @@
 #include <iostream>
+#include <charconv> // Para validar números sin lanzar excepciones
 #include <string>
 #include <cstring>
 #include <filesystem> // Para crear la carpeta de buzones en el caso que no exista
@@ -417,23 +418,52 @@ void atender_cliente(int client_fd) {
                 send(client_fd, final_resp.c_str(), final_resp.length(), 0);
             }
 
-            //COMANDO RETR
+            // COMANDO RETR
             else if (comando == "RETR") {
-                int n = std::stoi(arg1);
-                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
-                if (n > 0 && n <= (int)mensajes.size()) {
-                    std::ifstream archivo(mensajes[n - 1]);
-                    std::string linea;
-                    while (std::getline(archivo, linea)) {
-                        // getline remueve el \n, así que se lo volvemos a poner (o \r\n)
-                        std::string resp = "222-" + linea + "\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                // El argumento debe ser un número entero sin otros argumentos.
+                std::string argumento_extra;
+                unsigned long long n = 0;
+                bool numero_valido = !arg1.empty();
+                for (char c : arg1) {
+                    if (c < '0' || c > '9') {
+                        numero_valido = false;
+                        break;
                     }
-                    std::string fin = "222 fin del mensaje\r\n";
-                    send(client_fd, fin.c_str(), fin.length(), 0);
-                } else {
-                    std::string resp = "552 No existe ese número de mensaje\r\n";
+                }
+                if (numero_valido) {
+                    auto resultado = std::from_chars(arg1.data(), arg1.data() + arg1.size(), n);
+                    numero_valido = (resultado.ec == std::errc() &&
+                                     resultado.ptr == arg1.data() + arg1.size());
+                }
+
+                if (!numero_valido || (iss >> argumento_extra)) {
+                    std::string resp = "501 Número inválido\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
+                } else {
+                    auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                    if (n == 0 || n > mensajes.size()) {
+                        std::string resp = "552 No existe ese número de mensaje\r\n";
+                        send(client_fd, resp.c_str(), resp.length(), 0);
+                    } else {
+                        // Leer los bytes del archivo tal como se guardaron.
+                        std::ifstream archivo(mensajes[static_cast<size_t>(n - 1)], std::ios::binary);
+                        if (!archivo.is_open()) {
+                            std::string resp = "552 No existe ese número de mensaje\r\n";
+                            send(client_fd, resp.c_str(), resp.length(), 0);
+                        } else {
+                            std::string linea_archivo;
+                            while (std::getline(archivo, linea_archivo)) {
+                                // getline elimina LF, pero deja CR si la línea usa CRLF.
+                                if (!linea_archivo.empty() && linea_archivo.back() == '\r') {
+                                    linea_archivo.pop_back();
+                                }
+                                std::string resp = "222-" + linea_archivo + "\r\n";
+                                send(client_fd, resp.c_str(), resp.length(), 0);
+                            }
+                            std::string fin = "222 fin del mensaje\r\n";
+                            send(client_fd, fin.c_str(), fin.length(), 0);
+                        }
+                    }
                 }
             }
 
