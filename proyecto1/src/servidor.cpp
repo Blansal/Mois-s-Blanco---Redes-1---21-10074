@@ -337,7 +337,7 @@ void atender_cliente(int client_fd) {
                 if (estado_global.canales.count(arg1)) {
                     auto& miembros = estado_global.canales[arg1].miembros;
                     for (int fd : miembros) {
-                        std::string resp = "213 " + estado_global.obtener_apodo(fd) + "\r\n";
+                        std::string resp = "213-" + estado_global.obtener_apodo(fd) + "\r\n";
                         send(client_fd, resp.c_str(), resp.length(), 0);
                     }
                     // Línea final
