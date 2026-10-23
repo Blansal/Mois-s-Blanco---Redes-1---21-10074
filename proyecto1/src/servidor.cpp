@@ -88,7 +88,7 @@ int iniciar_servidor(int puerto){
 
 void atender_cliente(int client_fd) {
     //Enviamos el saludo inicial
-    std::string saludo = "200 ci4835-nodo-quetzal listo\r\n";
+    std::string saludo = "200 servidor-prueba listo\r\n";
     send(client_fd, saludo.c_str(), saludo.length(), 0);
 
     //Registrar al cliente en el estado (protegido por el candado)
@@ -97,7 +97,9 @@ void atender_cliente(int client_fd) {
         estado_global.usuarios_conectados[client_fd] = {"", client_fd, false, {}};
     }
 
-    std::string buffer_cliente; // Buffer acumulador para la delimitacion
+    std::string buffer_cliente; // Acumula solo la línea actual
+    bool descartando_linea = false; // Si supera 512 bytes, ignorar hasta CRLF
+    bool ultimo_era_cr = false; // Permite detectar CRLF aunque llegue dividido
     char buffer_recv[1024]; // Buffer temporal
 
 
@@ -115,33 +117,43 @@ void atender_cliente(int client_fd) {
             break; //Rompe el while y la funcion termina
         }
 
-        buffer_cliente.append(buffer_recv, bytes_leidos);
-        
-        // VAlidacion del 502
-        if (buffer_cliente.length() > 512) {
-            std::string error502 = "502 Línea demasiado larga\r\n";
-            send(client_fd, error502.c_str(), error502.length(), 0);
-            
-            // MODO DESCARTE: Leemos y tiramos a la basura hasta encontrar un \r\n
-            bool encontrado_crlf = false;
-            while (!encontrado_crlf) {
-                memset(buffer_recv, 0, sizeof(buffer_recv));
-                int bytes_extra = recv(client_fd, buffer_recv, sizeof(buffer_recv), 0);
-                
-                if (bytes_extra <= 0) {
-                    encontrado_crlf = true; // Se desconectó
+        // TCP puede entregar varios comandos juntos o uno dividido en partes.
+        // Cada línea del CLIENTE puede medir como máximo 512 bytes, incluido CRLF.
+        std::vector<std::string> lineas;
+        for (int i = 0; i < bytes_leidos; ++i) {
+            char c = buffer_recv[i];
+
+            if (descartando_linea) {
+                // Ya respondimos 502: descartar solo hasta el siguiente CRLF.
+                if (ultimo_era_cr && c == '\n') {
+                    descartando_linea = false;
+                    ultimo_era_cr = false;
                 } else {
-                    std::string temp(buffer_recv, bytes_extra);
-                    if (temp.find("\r\n") != std::string::npos) {
-                        encontrado_crlf = true; // Encontramos el fin de la línea
-                    }
+                    ultimo_era_cr = (c == '\r');
                 }
+                continue;
             }
-            buffer_cliente.clear(); // Limpiamos y volvemos al inicio del while
-            continue; 
+
+            buffer_cliente.push_back(c);
+            size_t tam = buffer_cliente.size();
+
+            if (tam >= 2 && buffer_cliente[tam - 2] == '\r' && c == '\n') {
+                if (tam <= 512) {
+                    lineas.push_back(buffer_cliente.substr(0, tam - 2));
+                } else {
+                    std::string resp = "502 Línea demasiado larga\r\n";
+                    send(client_fd, resp.c_str(), resp.size(), 0);
+                }
+                buffer_cliente.clear();
+            } else if (tam > 512) {
+                // Todavía no llegó CRLF y la línea ya excede el límite.
+                std::string resp = "502 Línea demasiado larga\r\n";
+                send(client_fd, resp.c_str(), resp.size(), 0);
+                buffer_cliente.clear();
+                descartando_linea = true;
+                ultimo_era_cr = (c == '\r');
+            }
         }
-        
-        std::vector<std::string> lineas = extraer_lineas(buffer_cliente);
 
         bool cerrar_conexion = false; //Bandera si el cliente hace QUIT
 
@@ -175,6 +187,12 @@ void atender_cliente(int client_fd) {
                 send(client_fd, resp.c_str(), resp.length(), 0);
                 cerrar_conexion = true;
                 break; 
+            }
+
+            // Antes de registrarse, solo se permiten NICK y QUIT
+            else if (!usuario.registrado && comando != "NICK") {
+                std::string resp = "530 Primero debes registrarte con NICK\r\n";
+                send(client_fd, resp.c_str(), resp.length(), 0);
             }
 
             else if (comando == "NICK") {
@@ -275,7 +293,7 @@ void atender_cliente(int client_fd) {
                         send(client_fd, resp.c_str(), resp.length(), 0);
 
                         // Enviar a los demás (el emisor no recibe el evento 300)
-                        std::string mensaje_evt = "300 " + canal + " " + " [" + usuario.apodo + "] " + texto + "\r\n";
+                        std::string mensaje_evt = "300 " + canal + " " + usuario.apodo + ": " + texto + "\r\n";
                         for (int fd : estado_global.canales[canal].miembros) {
                             if (fd != client_fd) { // El emisor no recibe su propio mensaje
                                 send(fd, mensaje_evt.c_str(), mensaje_evt.length(), 0);
@@ -327,7 +345,7 @@ void atender_cliente(int client_fd) {
 
                     if (fd_destino != -1) {
                         // El destinatario ESTÁ conectado -> Enviar evento 301
-                        std::string evt = "301 [" + usuario.apodo + "] " + texto + "\r\n";
+                        std::string evt = "301 " + usuario.apodo + " " + texto + "\r\n";
                         send(fd_destino, evt.c_str(), evt.length(), 0);
                         
                         std::string resp = "250 Mensaje entregado\r\n";
