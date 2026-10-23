@@ -111,6 +111,30 @@ int iniciar_servidor(int puerto){
     return server_fd; // Retornamos el descriptor del socket
 }    
 
+// Eliminar un cliente de los canales cuando sale o se desconecta.
+// Esta función se llama únicamente mientras estado_global.candado está tomado.
+void quitar_cliente_de_canales(int client_fd, bool salida_voluntaria) {
+    auto it = estado_global.usuarios_conectados.find(client_fd);
+    if (it == estado_global.usuarios_conectados.end()) return;
+
+    std::string apodo = it->second.apodo;
+    for (auto& par : estado_global.canales) {
+        auto& miembros = par.second.miembros;
+        if (miembros.erase(client_fd) == 0) continue;
+
+        // El cliente ya no recibe avisos, solo los demás miembros del canal.
+        if (!apodo.empty()) {
+            std::string evento = "302 " + par.first + " " + apodo +
+                                 (salida_voluntaria ? " salió\r\n" : " desconecta\r\n");
+            for (int fd : miembros) {
+                send(fd, evento.c_str(), evento.size(), MSG_NOSIGNAL);
+            }
+        }
+    }
+
+    estado_global.usuarios_conectados.erase(it);
+}
+
 void atender_cliente(int client_fd) {
     //Enviamos el saludo inicial
     std::string saludo = "200 servidor-prueba listo\r\n";
@@ -142,8 +166,8 @@ void atender_cliente(int client_fd) {
         if (bytes_leidos <= 0) {
             std::cout << "[Servidor] Cliente desconectado abruptamente.\n";
             std::lock_guard<std::mutex> lock(estado_global.candado);
-            estado_global.usuarios_conectados.erase(client_fd);
-            break; //Rompe el while y la funcion termina
+            quitar_cliente_de_canales(client_fd, false);
+            break; // Rompe el while y la función termina
         }
 
         // TCP puede entregar varios comandos juntos o uno dividido en partes.
@@ -513,8 +537,8 @@ void atender_cliente(int client_fd) {
 
         if (cerrar_conexion) {
             std::lock_guard<std::mutex> lock(estado_global.candado);
-            estado_global.usuarios_conectados.erase(client_fd);
-            break; 
+            quitar_cliente_de_canales(client_fd, true);
+            break;
         }
     }
     close(client_fd);
@@ -523,6 +547,9 @@ void atender_cliente(int client_fd) {
 
 // FUNCION MAIN
 int main(int argc, char* argv[]){
+    // Un cliente puede desconectarse justo cuando se le está enviando un evento.
+    // Evitar que SIGPIPE cierre todo el servidor por ese motivo.
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, manejar_signal); // Se registra la funcion para que se ejecute cuando el usuario precione ctrl + c o se envie el SIGTERM
     signal(SIGTERM, manejar_signal);
 
