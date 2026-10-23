@@ -186,11 +186,12 @@ Las respuestas `405` también incluyen `Allow: GET`.
 Los archivos se encuentran directamente en la raíz del repositorio:
 
 ```text
-/
+.
 ├── .gitignore
 ├── Makefile
 ├── README.md
 ├── PROTOCOLO.md
+├── informe.pdf
 ├── captura.pcapng
 └── src/
     ├── servidor.cpp
@@ -216,15 +217,13 @@ Al compilar, se generan los ejecutables `servidor` y `cliente`, además de la ca
 
 Durante la ejecución también puede crearse la carpeta `buzones/`. Estos archivos y carpetas generados no se incluyen en el repositorio.
 
-El informe técnico se incorporará como `informe.pdf` en la raíz del repositorio.
-
 ## 7. Documentación y pruebas
 
-El proyecto incluye los siguientes archivos de documentación:
+El proyecto incluye los siguientes archivos de documentación y entrega:
 
 - **`PROTOCOLO.md`:** especificación de los comandos, respuestas, códigos de error y eventos del protocolo.
+- **`informe.pdf`:** informe técnico que explica el modelo de concurrencia, la delimitación de mensajes TCP, las limitaciones conocidas y el uso de herramientas de inteligencia artificial durante el desarrollo.
 - **`captura.pcapng`:** captura del tráfico de red realizada con TShark, compatible con Wireshark.
-- **`informe.pdf`:** informe técnico que se incorporará con la explicación del modelo de concurrencia, la delimitación de mensajes y las limitaciones conocidas.
 
 ### Pruebas realizadas
 
