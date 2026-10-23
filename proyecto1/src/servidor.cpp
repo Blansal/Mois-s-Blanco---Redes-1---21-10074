@@ -44,6 +44,30 @@ std::string dir_buzones = "";
 EstadoServidor estado_global;
 
 // FUNCIONES //
+// Validaciones de nombres según el protocolo.
+bool apodo_valido(const std::string& apodo) {
+    if (apodo.empty() || apodo.size() > 16) return false;
+
+    for (char c : apodo) {
+        bool letra = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        bool numero = (c >= '0' && c <= '9');
+        if (!letra && !numero && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
+bool canal_valido(const std::string& canal) {
+    if (canal.size() < 2 || canal.size() > 33 || canal[0] != '#') return false;
+
+    for (size_t i = 1; i < canal.size(); ++i) {
+        char c = canal[i];
+        bool letra = (c >= 'a' && c <= 'z');
+        bool numero = (c >= '0' && c <= '9');
+        if (!letra && !numero && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 void mostrar_uso(const char* programa){
     std::cerr<< "Uso: " << programa << " --chat <puerto> --http <puerto> --buzones <carpeta>\n"; 
 }
@@ -196,8 +220,9 @@ void atender_cliente(int client_fd) {
             }
 
             else if (comando == "NICK") {
-                if (arg1.empty() || arg1.length() > 16) {
-                    std::string resp = "501 Apodo inválido (1-16 caracteres)\r\n";
+                std::string argumento_extra;
+                if (!apodo_valido(arg1) || (iss >> argumento_extra)) {
+                    std::string resp = "501 Apodo inválido\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
                 } else if (estado_global.apodo_en_uso(arg1)) {
                     std::string resp = "433 Apodo en uso\r\n";
@@ -226,8 +251,9 @@ void atender_cliente(int client_fd) {
 
             // COMANDO JOIN
             else if (comando == "JOIN") {
-                if (arg1.empty() || arg1[0] != '#') {
-                    std::string resp = "501 Canal inválido (debe empezar con #)\r\n";
+                std::string argumento_extra;
+                if (!canal_valido(arg1) || (iss >> argumento_extra)) {
+                    std::string resp = "501 Canal inválido\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     // Agregamos al usuario al canal
