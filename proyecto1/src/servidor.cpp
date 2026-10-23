@@ -70,6 +70,51 @@ bool canal_valido(const std::string& canal) {
     return true;
 }
 
+// Comprobar UTF-8 antes de interpretar los comandos recibidos por TCP.
+// Rechaza bytes de continuación sueltos, secuencias incompletas,
+// codificaciones excesivamente largas y puntos de código inválidos.
+bool utf8_valido(const std::string& texto) {
+    for (size_t i = 0; i < texto.size();) {
+        unsigned char c = static_cast<unsigned char>(texto[i]);
+        if (c <= 0x7F) {
+            ++i;
+            continue;
+        }
+
+        size_t restantes = 0;
+        unsigned int valor = 0;
+        unsigned int minimo = 0;
+        if (c >= 0xC2 && c <= 0xDF) {
+            restantes = 1;
+            valor = c & 0x1F;
+            minimo = 0x80;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            restantes = 2;
+            valor = c & 0x0F;
+            minimo = 0x800;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            restantes = 3;
+            valor = c & 0x07;
+            minimo = 0x10000;
+        } else {
+            return false;
+        }
+
+        if (i + restantes >= texto.size()) return false;
+        for (size_t j = 1; j <= restantes; ++j) {
+            unsigned char siguiente = static_cast<unsigned char>(texto[i + j]);
+            if ((siguiente & 0xC0) != 0x80) return false;
+            valor = (valor << 6) | (siguiente & 0x3F);
+        }
+        if (valor < minimo || valor > 0x10FFFF ||
+            (valor >= 0xD800 && valor <= 0xDFFF)) {
+            return false;
+        }
+        i += restantes + 1;
+    }
+    return true;
+}
+
 void mostrar_uso(const char* programa){
     std::cerr<< "Uso: " << programa << " --chat <puerto> --http <puerto> --buzones <carpeta>\n"; 
 }
@@ -236,6 +281,14 @@ void atender_cliente(int client_fd) {
         // COMANDOS
         for (const std::string& linea : lineas) {
             if (linea.empty()) continue;
+
+            // La línea completa debe estar codificada en UTF-8 válido.
+            // Un comando inválido no debe cerrar el servidor ni afectar al siguiente.
+            if (!utf8_valido(linea)) {
+                std::string resp = "501 Codificación UTF-8 inválida\r\n";
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                continue;
+            }
 
             std::istringstream iss(linea);
             std::string comando, arg1;
