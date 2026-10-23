@@ -62,6 +62,7 @@
 - `421`: Servidor saturado; la conexión se cerrará.
 - `433`: Apodo en uso por otro usuario conectado.
 - `442`: No eres miembro de ese canal.
+- `451`: Error temporal al guardar un mensaje en el buzón.
 
 ### 3.4. Errores Permanentes (5xx)
 
@@ -83,6 +84,7 @@
 - **Numeración del buzón:** Los números asignados a los mensajes permanecen estables durante la sesión del usuario.
 - **Persistencia entre reinicios:** Los mensajes almacenados deben mantenerse disponibles aunque el servidor se cierre y vuelva a iniciarse.
 - **`PRIV` a uno mismo:** Si un usuario envía un mensaje privado a su propio apodo, el servidor lo procesa como un mensaje privado normal y lo entrega al usuario conectado, sin aplicar una regla especial de rechazo.
+- **Error de almacenamiento:** Si ocurre un problema al guardar un mensaje privado en el buzón, el servidor responde `451 Error temporal al guardar el mensaje`, en lugar de confirmar el almacenamiento con `251`.
 
 ## 5. Puerta HTTP
 
@@ -174,7 +176,7 @@ S: 221 1 mensajes
 C: RETR 1
 S: 222-From: ana@chat.ci4835
 S: 222-To: pedro@chat.ci4835
-S: 222-Date: Thu, 15 Oct 2026 10:15:02 -0400
+S: 222-Date: Thu, 15 Oct 2026 14:15:02 +0000
 S: 222-Subject: Mensaje privado
 S: 222-Message-ID: <12345@chat.ci4835>
 S: 222-
