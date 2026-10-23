@@ -122,6 +122,10 @@ void atender_cliente(int client_fd) {
         estado_global.usuarios_conectados[client_fd] = {"", client_fd, false, {}};
     }
 
+    // Mantener una numeración fija de los mensajes durante esta conexión.
+    // Se carga al aceptar NICK y no se vuelve a ordenar en cada comando.
+    std::vector<fs::path> mensajes_sesion;
+
     std::string buffer_cliente; // Acumula solo la línea actual
     bool descartando_linea = false; // Si supera 512 bytes, ignorar hasta CRLF
     bool ultimo_era_cr = false; // Permite detectar CRLF aunque llegue dividido
@@ -198,12 +202,11 @@ void atender_cliente(int client_fd) {
 
             //Comando QUIT
             if (comando == "QUIT") {
-                // borrados pendientes (DELE)
-                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
+                // Aplicar al salir los borrados marcados durante la sesión.
+                // Los índices corresponden a las rutas guardadas al aceptar NICK.
                 for (int idx : usuario.mensajes_a_borrar) {
-                    // idx es 1-based (el primero es 1)
-                    if (idx > 0 && idx <= (int)mensajes.size()) {
-                        borrar_mensaje(mensajes[idx - 1]);
+                    if (idx > 0 && static_cast<size_t>(idx) <= mensajes_sesion.size()) {
+                        borrar_mensaje(mensajes_sesion[static_cast<size_t>(idx - 1)]);
                     }
                 }
                 usuario.mensajes_a_borrar.clear();
@@ -235,10 +238,11 @@ void atender_cliente(int client_fd) {
                     send(client_fd, resp.c_str(), resp.length(), 0);
                     std::cout << "[Servidor] Cliente " << client_fd << " registrado como " << arg1 << "\n";
                 
-                    // Avisamos si hay mensajes en el buzon
-                    auto mensajes = obtener_mensajes(dir_buzones, arg1);
-                    if (!mensajes.empty()) {
-                        std::string resp303 = "303 " + std::to_string(mensajes.size()) + "\r\n";
+                    // Tomar una lista fija del buzón para esta sesión.
+                    mensajes_sesion = obtener_mensajes(dir_buzones, arg1);
+                    usuario.mensajes_a_borrar.clear();
+                    if (!mensajes_sesion.empty()) {
+                        std::string resp303 = "303 " + std::to_string(mensajes_sesion.size()) + "\r\n";
                         send(client_fd, resp303.c_str(), resp303.length(), 0);
                     }
 
@@ -400,21 +404,19 @@ void atender_cliente(int client_fd) {
             // COMANDO DEL BUZON ---------------------------------------- //
             // COMANDO STAT
             else if (comando == "STAT") {
-                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
                 uintmax_t total_bytes = 0;
-                for (const auto& m : mensajes) total_bytes += fs::file_size(m);
-                std::string resp = "220 " + std::to_string(mensajes.size()) + " " + std::to_string(total_bytes) + "\r\n";
+                for (const auto& m : mensajes_sesion) total_bytes += fs::file_size(m);
+                std::string resp = "220 " + std::to_string(mensajes_sesion.size()) + " " + std::to_string(total_bytes) + "\r\n";
                 send(client_fd, resp.c_str(), resp.length(), 0);
             }
 
             // COMANDO LIST
             else if (comando == "LIST") {
-                auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
-                for (size_t i = 0; i < mensajes.size(); ++i) {
-                    std::string resp = "221-" + std::to_string(i + 1) + " " + std::to_string(fs::file_size(mensajes[i])) + "\r\n";
+                for (size_t i = 0; i < mensajes_sesion.size(); ++i) {
+                    std::string resp = "221-" + std::to_string(i + 1) + " " + std::to_string(fs::file_size(mensajes_sesion[i])) + "\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
                 }
-                std::string final_resp = "221 " + std::to_string(mensajes.size()) + " mensajes\r\n";
+                std::string final_resp = "221 " + std::to_string(mensajes_sesion.size()) + " mensajes\r\n";
                 send(client_fd, final_resp.c_str(), final_resp.length(), 0);
             }
 
@@ -440,13 +442,12 @@ void atender_cliente(int client_fd) {
                     std::string resp = "501 Número inválido\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
-                    auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
-                    if (n == 0 || n > mensajes.size()) {
+                    if (n == 0 || n > mensajes_sesion.size()) {
                         std::string resp = "552 No existe ese número de mensaje\r\n";
                         send(client_fd, resp.c_str(), resp.length(), 0);
                     } else {
                         // Leer los bytes del archivo tal como se guardaron.
-                        std::ifstream archivo(mensajes[static_cast<size_t>(n - 1)], std::ios::binary);
+                        std::ifstream archivo(mensajes_sesion[static_cast<size_t>(n - 1)], std::ios::binary);
                         if (!archivo.is_open()) {
                             std::string resp = "552 No existe ese número de mensaje\r\n";
                             send(client_fd, resp.c_str(), resp.length(), 0);
@@ -469,19 +470,32 @@ void atender_cliente(int client_fd) {
 
             // COMANDO DELE
             else if (comando == "DELE") {
-                try {
-                    int n = std::stoi(arg1);
-                    auto mensajes = obtener_mensajes(dir_buzones, usuario.apodo);
-                    if (n > 0 && n <= (int)mensajes.size()) {
-                        usuario.mensajes_a_borrar.insert(n); // Solo lo marcamos
-                        std::string resp = "223 Mensaje " + std::to_string(n) + " marcado para borrar\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
-                    } else {
-                        std::string resp = "552 No existe ese número de mensaje\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                // Solo se aceptan números completos: "1abc" no debe borrar el 1.
+                std::string argumento_extra;
+                unsigned long long n = 0;
+                bool numero_valido = !arg1.empty();
+                for (char c : arg1) {
+                    if (c < '0' || c > '9') {
+                        numero_valido = false;
+                        break;
                     }
-                } catch (...) {
+                }
+                if (numero_valido) {
+                    auto resultado = std::from_chars(arg1.data(), arg1.data() + arg1.size(), n);
+                    numero_valido = (resultado.ec == std::errc() &&
+                                     resultado.ptr == arg1.data() + arg1.size());
+                }
+
+                if (!numero_valido || (iss >> argumento_extra)) {
                     std::string resp = "501 Número inválido\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else if (n == 0 || n > mensajes_sesion.size()) {
+                    std::string resp = "552 No existe ese número de mensaje\r\n";
+                    send(client_fd, resp.c_str(), resp.length(), 0);
+                } else {
+                    // Solo marcar; el archivo se borra cuando llega QUIT.
+                    usuario.mensajes_a_borrar.insert(static_cast<int>(n));
+                    std::string resp = "223 Mensaje " + std::to_string(n) + " marcado para borrar\r\n";
                     send(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
