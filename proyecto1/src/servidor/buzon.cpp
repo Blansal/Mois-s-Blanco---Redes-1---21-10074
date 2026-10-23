@@ -1,89 +1,134 @@
-
 #include "servidor/buzon.h"
-#include <filesystem>
-#include <fstream>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
+#include <iostream>
+#include <locale>
 #include <sstream>
-#include <random>
-#include <algorithm>
+#include <string>
+#include <vector>
+
+#include <fcntl.h>    // open(), O_CREAT, O_EXCL
+#include <unistd.h>   // write(), close(), getpid()
 
 namespace fs = std::filesystem;
 
-// Genera un Message-ID único (simulado)
-std::string generar_message_id() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(10000, 99999);
-    return "<" + std::to_string(dis(gen)) + "@chat.ci4835>";
+namespace {
+// Permite diferenciar mensajes creados en el mismo instante.
+std::atomic<unsigned long long> contador_mensajes{0};
+
+std::string fecha_rfc5322() {
+    const std::time_t ahora = std::time(nullptr);
+    std::tm fecha_utc{};
+    if (gmtime_r(&ahora, &fecha_utc) == nullptr) {
+        return "Thu, 01 Jan 1970 00:00:00 +0000";
+    }
+
+    // Se escribe la hora en UTC, de modo que +0000 siempre sea correcto.
+    std::ostringstream salida;
+    salida.imbue(std::locale::classic());
+    salida << std::put_time(&fecha_utc, "%a, %d %b %Y %H:%M:%S +0000");
+    return salida.str();
 }
 
-// Obtiene la fecha actual en formato RFC 5322
-std::string obtener_fecha_rfc5322() {
-    auto ahora = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(ahora);
-    std::tm tm_buf;
-    localtime_r(&t, &tm_buf);
-
-    std::ostringstream oss;
-    oss << std::put_time(&tm_buf, "%a, %d %b %Y %H:%M:%S -0400");
-    return oss.str();
+bool escribir_completo(int fd, const std::string& contenido) {
+    std::size_t enviados = 0;
+    while (enviados < contenido.size()) {
+        const ssize_t n = ::write(fd, contenido.data() + enviados,
+                                  contenido.size() - enviados);
+        if (n > 0) {
+            enviados += static_cast<std::size_t>(n);
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
+} // namespace
 
 void guardar_en_buzon(const std::string& dir_buzones,
                       const std::string& destinatario,
                       const std::string& remitente,
                       const std::string& texto) {
-    // Crear la carpeta del usuario si no existe
-    fs::path carpeta_usuario = fs::path(dir_buzones) / destinatario;
-    if (!fs::exists(carpeta_usuario)) {
-        fs::create_directories(carpeta_usuario);
+    const fs::path carpeta = fs::path(dir_buzones) / destinatario;
+    std::error_code ec;
+    fs::create_directories(carpeta, ec);
+    if (ec) {
+        std::cerr << "[Buzon] No se pudo crear la carpeta: " << ec.message() << '\n';
+        return;
     }
 
-    // Generar el nombre del archivo usando timestamp
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    // O_EXCL impide sobrescribir otro mensaje si coinciden los nombres.
+    fs::path ruta;
+    std::string id_unico;
+    int fd = -1;
+    for (int intento = 0; intento < 100; ++intento) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto secuencia = contador_mensajes.fetch_add(1);
+        std::ostringstream nombre;
+        nombre << std::setfill('0') << std::setw(20) << ns
+               << '_' << ::getpid() << '_' << secuencia;
+        id_unico = nombre.str();
+        ruta = carpeta / ("msg_" + id_unico + ".eml");
+        fd = ::open(ruta.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) break;
+        if (errno != EEXIST) break;
+    }
 
-    fs::path ruta_archivo = carpeta_usuario /
-        ("msg_" + std::to_string(ms) + ".eml");
+    if (fd < 0) {
+        std::cerr << "[Buzon] No se pudo crear el mensaje: "
+                  << std::error_code(errno, std::generic_category()).message() << '\n';
+        return;
+    }
 
-    // Guardar el mensaje en formato RFC 5322
-    std::ofstream archivo(ruta_archivo);
-    if (archivo.is_open()) {
-        archivo << "From: " << remitente << "@chat.ci4835\r\n";
-        archivo << "To: " << destinatario << "@chat.ci4835\r\n";
-        archivo << "Date: " << obtener_fecha_rfc5322() << "\r\n";
-        archivo << "Subject: Mensaje privado\r\n";
-        archivo << "Message-ID: " << generar_message_id() << "\r\n";
-        archivo << "\r\n";
-        archivo << texto << "\r\n";
-        archivo.close();
+    // RFC 5322: cabeceras, linea en blanco y cuerpo, siempre con CRLF.
+    std::ostringstream mensaje;
+    mensaje << "From: " << remitente << "@chat.ci4835\r\n"
+            << "To: " << destinatario << "@chat.ci4835\r\n"
+            << "Date: " << fecha_rfc5322() << "\r\n"
+            << "Subject: Mensaje privado\r\n"
+            << "Message-ID: <" << id_unico << "@chat.ci4835>\r\n"
+            << "\r\n"
+            << texto << "\r\n";
+
+    const bool escrito = escribir_completo(fd, mensaje.str());
+    const bool cerrado = (::close(fd) == 0);
+    if (!escrito || !cerrado) {
+        std::cerr << "[Buzon] Error al guardar el mensaje.\n";
+        fs::remove(ruta, ec); // No dejar mensajes incompletos.
     }
 }
 
-std::vector<fs::path> obtener_mensajes(
-    const std::string& dir_buzones,
-    const std::string& apodo) {
-
+std::vector<fs::path> obtener_mensajes(const std::string& dir_buzones,
+                                      const std::string& apodo) {
     std::vector<fs::path> mensajes;
-    fs::path carpeta = fs::path(dir_buzones) / apodo;
+    const fs::path carpeta = fs::path(dir_buzones) / apodo;
+    std::error_code ec;
+    if (!fs::is_directory(carpeta, ec)) return mensajes;
 
-    if (fs::exists(carpeta)) {
-        for (const auto& entry : fs::directory_iterator(carpeta)) {
-            if (entry.path().extension() == ".eml") {
-                mensajes.push_back(entry.path());
-            }
+    for (fs::directory_iterator it(carpeta, ec), fin; !ec && it != fin;
+         it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().extension() == ".eml") {
+            mensajes.push_back(it->path());
         }
-
-        std::sort(mensajes.begin(), mensajes.end());
+        if (ec) break;
     }
-
+    std::sort(mensajes.begin(), mensajes.end());
     return mensajes;
 }
 
 void borrar_mensaje(const fs::path& ruta) {
-    if (fs::exists(ruta)) {
-        fs::remove(ruta);
+    std::error_code ec;
+    fs::remove(ruta, ec);
+    if (ec) {
+        std::cerr << "[Buzon] No se pudo borrar el mensaje: " << ec.message() << '\n';
     }
 }
