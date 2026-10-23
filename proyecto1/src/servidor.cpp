@@ -88,7 +88,7 @@ int iniciar_servidor(int puerto){
 
 void atender_cliente(int client_fd) {
     //Enviamos el saludo inicial
-    std::string saludo = "200 servidor-prueba listo\r\n";
+    std::string saludo = "200 ci4835-nodo-quetzal listo\r\n";
     send(client_fd, saludo.c_str(), saludo.length(), 0);
 
     //Registrar al cliente en el estado (protegido por el candado)
