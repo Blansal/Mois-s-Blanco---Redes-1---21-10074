@@ -53,7 +53,7 @@ bool escribir_completo(int fd, const std::string& contenido) {
 }
 } // namespace
 
-void guardar_en_buzon(const std::string& dir_buzones,
+bool guardar_en_buzon(const std::string& dir_buzones,
                       const std::string& destinatario,
                       const std::string& remitente,
                       const std::string& texto) {
@@ -62,7 +62,7 @@ void guardar_en_buzon(const std::string& dir_buzones,
     fs::create_directories(carpeta, ec);
     if (ec) {
         std::cerr << "[Buzon] No se pudo crear la carpeta: " << ec.message() << '\n';
-        return;
+        return false;
     }
 
     // O_EXCL impide sobrescribir otro mensaje si coinciden los nombres.
@@ -86,7 +86,7 @@ void guardar_en_buzon(const std::string& dir_buzones,
     if (fd < 0) {
         std::cerr << "[Buzon] No se pudo crear el mensaje: "
                   << std::error_code(errno, std::generic_category()).message() << '\n';
-        return;
+        return false;
     }
 
     // RFC 5322: cabeceras, linea en blanco y cuerpo, siempre con CRLF.
@@ -104,7 +104,9 @@ void guardar_en_buzon(const std::string& dir_buzones,
     if (!escrito || !cerrado) {
         std::cerr << "[Buzon] Error al guardar el mensaje.\n";
         fs::remove(ruta, ec); // No dejar mensajes incompletos.
+        return false;
     }
+    return true;
 }
 
 std::vector<fs::path> obtener_mensajes(const std::string& dir_buzones,
