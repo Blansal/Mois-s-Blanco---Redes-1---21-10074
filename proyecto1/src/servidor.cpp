@@ -538,8 +538,11 @@ void atender_cliente(int client_fd) {
                         fs::path carpeta = fs::path(dir_buzones) / destinatario;
                         if (fs::exists(carpeta)) {
                             // Existe -> Guardar en buzón (RFC 5322)
-                            guardar_en_buzon(dir_buzones, destinatario, usuario.apodo, texto);
-                            std::string resp = "251 Usuario desconectado; mensaje guardado en su buzón\r\n";
+                            // Solo confirmamos 251 cuando el archivo quedó guardado.
+                            bool guardado = guardar_en_buzon(dir_buzones, destinatario, usuario.apodo, texto);
+                            std::string resp = guardado
+                                ? "251 Usuario desconectado; mensaje guardado en su buzón\r\n"
+                                : "451 Error temporal al guardar el mensaje\r\n";
                             enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                         } else {
                             // No existe -> Error 550
