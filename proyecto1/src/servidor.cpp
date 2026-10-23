@@ -1,5 +1,6 @@
 #include <iostream>
 #include <charconv> // Para validar números sin lanzar excepciones
+#include <cerrno> // errno, EINTR
 #include <string>
 #include <cstring>
 #include <filesystem> // Para crear la carpeta de buzones en el caso que no exista
@@ -104,12 +105,34 @@ int iniciar_servidor(int puerto){
     } 
 
     // Lo colocamos a escuchar
-    if(listen(server_fd, 10) < 0) {
+    if(listen(server_fd, SOMAXCONN) < 0) {
         perror("[Error] listen()"); exit(1);
     }
     std::cout << "[Servidor] Escuchando en el puerto " << puerto << "...\n";
     return server_fd; // Retornamos el descriptor del socket
 }    
+
+// Enviar sin bloquear: un cliente que deja de leer no debe detener a los demás.
+// Si el sistema no puede aceptar todo el mensaje, desconectamos ese cliente
+// para no dejar respuestas TCP a medias dentro de una conexión abierta.
+ssize_t enviar_sin_bloquear(int fd, const char* datos, size_t longitud, int flags) {
+    size_t enviados = 0;
+    while (enviados < longitud) {
+        ssize_t n = send(fd, datos + enviados, longitud - enviados,
+                         flags | MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0) {
+            enviados += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+
+        // EAGAIN indica que el búfer de salida del cliente está lleno.
+        // shutdown despierta su hilo recv(), que limpiará canales y usuarios.
+        shutdown(fd, SHUT_RDWR);
+        return -1;
+    }
+    return static_cast<ssize_t>(enviados);
+}
 
 // Eliminar un cliente de los canales cuando sale o se desconecta.
 // Esta función se llama únicamente mientras estado_global.candado está tomado.
@@ -127,7 +150,7 @@ void quitar_cliente_de_canales(int client_fd, bool salida_voluntaria) {
             std::string evento = "302 " + par.first + " " + apodo +
                                  (salida_voluntaria ? " salió\r\n" : " desconecta\r\n");
             for (int fd : miembros) {
-                send(fd, evento.c_str(), evento.size(), MSG_NOSIGNAL);
+                enviar_sin_bloquear(fd, evento.c_str(), evento.size(), MSG_NOSIGNAL);
             }
         }
     }
@@ -138,7 +161,7 @@ void quitar_cliente_de_canales(int client_fd, bool salida_voluntaria) {
 void atender_cliente(int client_fd) {
     //Enviamos el saludo inicial
     std::string saludo = "200 servidor-prueba listo\r\n";
-    send(client_fd, saludo.c_str(), saludo.length(), 0);
+    enviar_sin_bloquear(client_fd, saludo.c_str(), saludo.length(), 0);
 
     //Registrar al cliente en el estado (protegido por el candado)
     {
@@ -195,13 +218,13 @@ void atender_cliente(int client_fd) {
                     lineas.push_back(buffer_cliente.substr(0, tam - 2));
                 } else {
                     std::string resp = "502 Línea demasiado larga\r\n";
-                    send(client_fd, resp.c_str(), resp.size(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
                 }
                 buffer_cliente.clear();
             } else if (tam > 512) {
                 // Todavía no llegó CRLF y la línea ya excede el límite.
                 std::string resp = "502 Línea demasiado larga\r\n";
-                send(client_fd, resp.c_str(), resp.size(), 0);
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
                 buffer_cliente.clear();
                 descartando_linea = true;
                 ultimo_era_cr = (c == '\r');
@@ -236,7 +259,7 @@ void atender_cliente(int client_fd) {
                 usuario.mensajes_a_borrar.clear();
 
                 std::string resp = "299 Adiós\r\n";
-                send(client_fd, resp.c_str(), resp.length(), 0);
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 cerrar_conexion = true;
                 break; 
             }
@@ -244,22 +267,22 @@ void atender_cliente(int client_fd) {
             // Antes de registrarse, solo se permiten NICK y QUIT
             else if (!usuario.registrado && comando != "NICK") {
                 std::string resp = "530 Primero debes registrarte con NICK\r\n";
-                send(client_fd, resp.c_str(), resp.length(), 0);
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
             }
 
             else if (comando == "NICK") {
                 std::string argumento_extra;
                 if (!apodo_valido(arg1) || (iss >> argumento_extra)) {
                     std::string resp = "501 Apodo inválido\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else if (estado_global.apodo_en_uso(arg1)) {
                     std::string resp = "433 Apodo en uso\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     usuario.apodo = arg1;
                     usuario.registrado = true;
                     std::string resp = "201 Bienvenido, " + arg1 + "\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     std::cout << "[Servidor] Cliente " << client_fd << " registrado como " << arg1 << "\n";
                 
                     // Tomar una lista fija del buzón para esta sesión.
@@ -267,7 +290,7 @@ void atender_cliente(int client_fd) {
                     usuario.mensajes_a_borrar.clear();
                     if (!mensajes_sesion.empty()) {
                         std::string resp303 = "303 " + std::to_string(mensajes_sesion.size()) + "\r\n";
-                        send(client_fd, resp303.c_str(), resp303.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp303.c_str(), resp303.length(), 0);
                     }
 
                     // Crear la carpeta para los futuros mensajes
@@ -283,19 +306,19 @@ void atender_cliente(int client_fd) {
                 std::string argumento_extra;
                 if (!canal_valido(arg1) || (iss >> argumento_extra)) {
                     std::string resp = "501 Canal inválido\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     // Agregamos al usuario al canal
                     estado_global.canales[arg1].miembros.insert(client_fd);
                     
                     // El que se une recibe la confirmación 210
                     std::string resp = "210 Unida a " + arg1 + "\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
 
                     // Avisamos a TODOS los del canal (incluyendo al que entró) con el evento 302
                     std::string aviso = "302 " + arg1 + " " + usuario.apodo + " entró\r\n";
                     for (int fd : estado_global.canales[arg1].miembros) {
-                        send(fd, aviso.c_str(), aviso.length(), 0);
+                        enviar_sin_bloquear(fd, aviso.c_str(), aviso.length(), 0);
                     }
                 }
             }
@@ -306,15 +329,15 @@ void atender_cliente(int client_fd) {
                     estado_global.canales[arg1].miembros.erase(client_fd);
                     
                     std::string resp = "211 Saliste de " + arg1 + "\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
 
                     std::string aviso = "302 " + arg1 + " " + usuario.apodo + " salió\r\n";
                     for (int fd : estado_global.canales[arg1].miembros) {
-                        send(fd, aviso.c_str(), aviso.length(), 0);
+                        enviar_sin_bloquear(fd, aviso.c_str(), aviso.length(), 0);
                     }
                 } else {
                     std::string resp = "442 No eres miembro de ese canal\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
 
@@ -345,18 +368,18 @@ void atender_cliente(int client_fd) {
                         
                         // Confirmación al emisor
                         std::string resp = "250 OK\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
 
                         // Enviar a los demás (el emisor no recibe el evento 300)
                         std::string mensaje_evt = "300 " + canal + " " + usuario.apodo + ": " + texto + "\r\n";
                         for (int fd : estado_global.canales[canal].miembros) {
                             if (fd != client_fd) { // El emisor no recibe su propio mensaje
-                                send(fd, mensaje_evt.c_str(), mensaje_evt.length(), 0);
+                                enviar_sin_bloquear(fd, mensaje_evt.c_str(), mensaje_evt.length(), 0);
                             }
                         }
                     } else {
                         std::string resp = "442 No eres miembro de ese canal\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     }
                 }
             }
@@ -367,14 +390,14 @@ void atender_cliente(int client_fd) {
                     auto& miembros = estado_global.canales[arg1].miembros;
                     for (int fd : miembros) {
                         std::string resp = "213-" + estado_global.obtener_apodo(fd) + "\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     }
                     // Línea final
                     std::string final_resp = "213 " + std::to_string(miembros.size()) + " miembros\r\n";
-                    send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, final_resp.c_str(), final_resp.length(), 0);
                 } else {
                     std::string resp = "551 Canal inexistente\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
 
@@ -382,10 +405,10 @@ void atender_cliente(int client_fd) {
             else if (comando == "CHANS") {
                 for (const auto& par : estado_global.canales) {
                     std::string resp = "212-" + par.first + " " + std::to_string(par.second.miembros.size()) + "\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
                 std::string final_resp = "212 " + std::to_string(estado_global.canales.size()) + " canales\r\n";
-                send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+                enviar_sin_bloquear(client_fd, final_resp.c_str(), final_resp.length(), 0);
             }
 
             // COMANDO PRIV
@@ -401,10 +424,10 @@ void atender_cliente(int client_fd) {
                     if (fd_destino != -1) {
                         // El destinatario ESTÁ conectado -> Enviar evento 301
                         std::string evt = "301 " + usuario.apodo + " " + texto + "\r\n";
-                        send(fd_destino, evt.c_str(), evt.length(), 0);
+                        enviar_sin_bloquear(fd_destino, evt.c_str(), evt.length(), 0);
                         
                         std::string resp = "250 Mensaje entregado\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     } else {
                         // El destinatario NO está conectado -> Verificar si existe en disco
                         fs::path carpeta = fs::path(dir_buzones) / destinatario;
@@ -412,16 +435,16 @@ void atender_cliente(int client_fd) {
                             // Existe -> Guardar en buzón (RFC 5322)
                             guardar_en_buzon(dir_buzones, destinatario, usuario.apodo, texto);
                             std::string resp = "251 Usuario desconectado; mensaje guardado en su buzón\r\n";
-                            send(client_fd, resp.c_str(), resp.length(), 0);
+                            enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                         } else {
                             // No existe -> Error 550
                             std::string resp = "550 Usuario desconocido\r\n";
-                            send(client_fd, resp.c_str(), resp.length(), 0);
+                            enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                         }
                     }
                 } else {
                     std::string resp = "501 Sintaxis inválida\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
 
@@ -439,7 +462,7 @@ void atender_cliente(int client_fd) {
                     total_bytes += fs::file_size(mensajes_sesion[i]);
                 }
                 std::string resp = "220 " + std::to_string(total_mensajes) + " " + std::to_string(total_bytes) + "\r\n";
-                send(client_fd, resp.c_str(), resp.length(), 0);
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
             }
 
             // COMANDO LIST
@@ -451,11 +474,11 @@ void atender_cliente(int client_fd) {
                     int numero = static_cast<int>(i + 1);
                     if (usuario.mensajes_a_borrar.count(numero) != 0) continue;
                     std::string resp = "221-" + std::to_string(numero) + " " + std::to_string(fs::file_size(mensajes_sesion[i])) + "\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     ++total_mensajes;
                 }
                 std::string final_resp = "221 " + std::to_string(total_mensajes) + " mensajes\r\n";
-                send(client_fd, final_resp.c_str(), final_resp.length(), 0);
+                enviar_sin_bloquear(client_fd, final_resp.c_str(), final_resp.length(), 0);
             }
 
             // COMANDO RETR
@@ -478,18 +501,18 @@ void atender_cliente(int client_fd) {
 
                 if (!numero_valido || (iss >> argumento_extra)) {
                     std::string resp = "501 Número inválido\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     if (n == 0 || n > mensajes_sesion.size() ||
                         usuario.mensajes_a_borrar.count(static_cast<int>(n)) != 0) {
                         std::string resp = "552 No existe ese número de mensaje\r\n";
-                        send(client_fd, resp.c_str(), resp.length(), 0);
+                        enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                     } else {
                         // Leer los bytes del archivo tal como se guardaron.
                         std::ifstream archivo(mensajes_sesion[static_cast<size_t>(n - 1)], std::ios::binary);
                         if (!archivo.is_open()) {
                             std::string resp = "552 No existe ese número de mensaje\r\n";
-                            send(client_fd, resp.c_str(), resp.length(), 0);
+                            enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                         } else {
                             std::string linea_archivo;
                             while (std::getline(archivo, linea_archivo)) {
@@ -498,10 +521,10 @@ void atender_cliente(int client_fd) {
                                     linea_archivo.pop_back();
                                 }
                                 std::string resp = "222-" + linea_archivo + "\r\n";
-                                send(client_fd, resp.c_str(), resp.length(), 0);
+                                enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                             }
                             std::string fin = "222 fin del mensaje\r\n";
-                            send(client_fd, fin.c_str(), fin.length(), 0);
+                            enviar_sin_bloquear(client_fd, fin.c_str(), fin.length(), 0);
                         }
                     }
                 }
@@ -527,26 +550,26 @@ void atender_cliente(int client_fd) {
 
                 if (!numero_valido || (iss >> argumento_extra)) {
                     std::string resp = "501 Número inválido\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else if (n == 0 || n > mensajes_sesion.size() ||
                            usuario.mensajes_a_borrar.count(static_cast<int>(n)) != 0) {
                     std::string resp = "552 No existe ese número de mensaje\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     // Solo marcar; el archivo se borra cuando llega QUIT.
                     usuario.mensajes_a_borrar.insert(static_cast<int>(n));
                     std::string resp = "223 Mensaje " + std::to_string(n) + " marcado para borrar\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
 
             else {
                 if (!usuario.registrado) {
                     std::string resp = "530 Primero debes registrarte con NICK\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 } else {
                     std::string resp = "500 Comando desconocido o no implementado\r\n";
-                    send(client_fd, resp.c_str(), resp.length(), 0);
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
         }
