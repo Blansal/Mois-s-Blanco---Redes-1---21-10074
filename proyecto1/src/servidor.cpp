@@ -280,7 +280,12 @@ void atender_cliente(int client_fd) {
 
         // COMANDOS
         for (const std::string& linea : lineas) {
-            if (linea.empty()) continue;
+            // Una línea sin comando también es una sintaxis incompleta.
+            if (linea.empty()) {
+                std::string resp = "501 Comando vacío\r\n";
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                continue;
+            }
 
             // La línea completa debe estar codificada en UTF-8 válido.
             // Un comando inválido no debe cerrar el servidor ni afectar al siguiente.
@@ -290,11 +295,28 @@ void atender_cliente(int client_fd) {
                 continue;
             }
 
+            // Dentro de un comando solo se aceptan espacios como separadores.
+            // NUL, tabuladores y otros caracteres de control no son argumentos válidos.
+            bool control_invalido = false;
+            for (unsigned char c : linea) {
+                if (c < 0x20 || c == 0x7F) {
+                    control_invalido = true;
+                    break;
+                }
+            }
+            if (control_invalido) {
+                std::string resp = "501 Caracter inválido en el comando\r\n";
+                enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                continue;
+            }
+
             std::istringstream iss(linea);
             std::string comando, arg1;
-            iss >> comando >> arg1; 
+            iss >> comando >> arg1;
 
-            for (char& c : comando) c = toupper(c);
+            for (char& c : comando) {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
 
             //Protegemos el acceso al usuario
             std::lock_guard<std::mutex> lock(estado_global.candado);
@@ -302,6 +324,11 @@ void atender_cliente(int client_fd) {
 
             //Comando QUIT
             if (comando == "QUIT") {
+                if (!arg1.empty()) {
+                    std::string resp = "501 QUIT no recibe argumentos\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                    continue;
+                }
                 // Aplicar al salir los borrados marcados durante la sesión.
                 // Los índices corresponden a las rutas guardadas al aceptar NICK.
                 for (int idx : usuario.mensajes_a_borrar) {
@@ -378,7 +405,11 @@ void atender_cliente(int client_fd) {
 
             // COMANDO PART
             else if (comando == "PART") {
-                if (estado_global.canales.count(arg1) && estado_global.canales[arg1].miembros.count(client_fd)) {
+                std::string argumento_extra;
+                if (!canal_valido(arg1) || (iss >> argumento_extra)) {
+                    std::string resp = "501 Canal inválido\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                } else if (estado_global.canales.count(arg1) && estado_global.canales[arg1].miembros.count(client_fd)) {
                     estado_global.canales[arg1].miembros.erase(client_fd);
                     
                     std::string resp = "211 Saliste de " + arg1 + "\r\n";
@@ -396,13 +427,19 @@ void atender_cliente(int client_fd) {
 
             // COMANDO MSG
             else if (comando == "MSG") {
-                // Separamos el canal del resto del texto (que puede tener espacios)
-                size_t espacio = linea.find(' ', 4); // 4 porque "MSG " mide 4 letras
-                if (espacio != std::string::npos) {
-                    std::string canal = linea.substr(4, espacio - 4);
-                    std::string texto = linea.substr(espacio + 1);
+                // iss conserva el resto de la línea: el mensaje puede contener espacios.
+                std::string texto;
+                std::getline(iss, texto);
+                if (!texto.empty() && texto.front() == ' ') texto.erase(0, 1);
 
-                    if (estado_global.canales.count(canal) && estado_global.canales[canal].miembros.count(client_fd)) {
+                if (!canal_valido(arg1) || texto.empty() ||
+                    texto.find_first_not_of(' ') == std::string::npos) {
+                    std::string resp = "501 Sintaxis inválida para MSG\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                } else {
+                    const std::string& canal = arg1;
+                    if (estado_global.canales.count(canal) &&
+                        estado_global.canales[canal].miembros.count(client_fd)) {
                         //Guardar en el historial con hora
                         auto ahora = std::chrono::system_clock::now();
                         std::time_t t = std::chrono::system_clock::to_time_t(ahora);
@@ -439,7 +476,11 @@ void atender_cliente(int client_fd) {
 
             // COMANDO WHO
             else if (comando == "WHO") {
-                if (estado_global.canales.count(arg1)) {
+                std::string argumento_extra;
+                if (!canal_valido(arg1) || (iss >> argumento_extra)) {
+                    std::string resp = "501 Canal inválido\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                } else if (estado_global.canales.count(arg1)) {
                     auto& miembros = estado_global.canales[arg1].miembros;
                     for (int fd : miembros) {
                         std::string resp = "213-" + estado_global.obtener_apodo(fd) + "\r\n";
@@ -456,6 +497,11 @@ void atender_cliente(int client_fd) {
 
             // COMANDO CHANS
             else if (comando == "CHANS") {
+                if (!arg1.empty()) {
+                    std::string resp = "501 CHANS no recibe argumentos\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                    continue;
+                }
                 for (const auto& par : estado_global.canales) {
                     std::string resp = "212-" + par.first + " " + std::to_string(par.second.miembros.size()) + "\r\n";
                     enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
@@ -466,12 +512,18 @@ void atender_cliente(int client_fd) {
 
             // COMANDO PRIV
             else if (comando == "PRIV") {
-                // Separamos el destinatario (arg1) del texto (que puede tener espacios)
-                size_t espacio = linea.find(' ', 5); // 5 porque "PRIV " mide 5 letras
-                if (espacio != std::string::npos && !arg1.empty()) {
-                    std::string destinatario = arg1;
-                    std::string texto = linea.substr(espacio + 1);
+                std::string texto;
+                std::getline(iss, texto);
+                if (!texto.empty() && texto.front() == ' ') texto.erase(0, 1);
 
+                // Validar el apodo también evita usar nombres como '../carpeta'
+                // al localizar el buzón de un usuario desconectado.
+                if (!apodo_valido(arg1) || texto.empty() ||
+                    texto.find_first_not_of(' ') == std::string::npos) {
+                    std::string resp = "501 Sintaxis inválida para PRIV\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                } else {
+                    std::string destinatario = arg1;
                     int fd_destino = estado_global.obtener_socket(destinatario);
 
                     if (fd_destino != -1) {
@@ -495,15 +547,17 @@ void atender_cliente(int client_fd) {
                             enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                         }
                     }
-                } else {
-                    std::string resp = "501 Sintaxis inválida\r\n";
-                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.length(), 0);
                 }
             }
 
             // COMANDO DEL BUZON ---------------------------------------- //
             // COMANDO STAT
             else if (comando == "STAT") {
+                if (!arg1.empty()) {
+                    std::string resp = "501 STAT no recibe argumentos\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                    continue;
+                }
                 // Los mensajes marcados con DELE no se cuentan durante la sesión,
                 // pero siguen en disco hasta que el usuario envía QUIT.
                 uintmax_t total_bytes = 0;
@@ -520,6 +574,11 @@ void atender_cliente(int client_fd) {
 
             // COMANDO LIST
             else if (comando == "LIST") {
+                if (!arg1.empty()) {
+                    std::string resp = "501 LIST no recibe argumentos\r\n";
+                    enviar_sin_bloquear(client_fd, resp.c_str(), resp.size(), 0);
+                    continue;
+                }
                 // Conservamos los números originales: si se marcó el mensaje 2,
                 // LIST muestra 1 y 3, y no renumera el 3 como 2.
                 size_t total_mensajes = 0;
